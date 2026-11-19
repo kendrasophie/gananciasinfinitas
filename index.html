@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Agenda de Viajes</title>
+  <meta name="description" content="Agenda privada de servicios de traslado ejecutivo.">
+  <meta name="robots" content="noindex, nofollow">
+  <meta name="theme-color" content="#0A0F24">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Agenda">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="icon-180.png">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@500;600;700&family=Manrope:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <!-- Pantalla de acceso -->
+  <section id="login" class="login" hidden>
+    <div class="login-card">
+      <div class="brand-mark lg" aria-hidden="true"></div>
+      <h1 class="login-title">Agenda de Viajes</h1>
+      <p class="login-sub">Servicio ejecutivo · Acceso privado</p>
+      <form id="login-form" autocomplete="on">
+        <label class="field" id="login-url-wrap">
+          <span>Dirección del servidor</span>
+          <input id="login-url" type="url" inputmode="url" placeholder="https://script.google.com/macros/s/…/exec" autocomplete="off">
+          <small>Se carga una sola vez. La encontrás en el Paso 3 de la guía.</small>
+        </label>
+        <label class="field">
+          <span>Clave de acceso</span>
+          <div class="pw">
+            <input id="login-clave" type="password" autocomplete="current-password" required>
+            <button type="button" class="pw-eye" id="pw-eye" aria-label="Mostrar u ocultar clave">👁</button>
+          </div>
+        </label>
+        <label class="check">
+          <input type="checkbox" id="login-recordar" checked>
+          <span>Mantener la app abierta en este dispositivo</span>
+        </label>
+        <p class="login-error" id="login-error" role="alert"></p>
+        <button class="btn btn-gold btn-block" type="submit" id="login-btn">Ingresar</button>
+      </form>
+      <div class="login-links">
+        <button class="link" id="login-cambiar-url" type="button" hidden>Cambiar dirección del servidor</button>
+        <button class="link" id="login-demo" type="button">Ver demostración</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- Aplicación -->
+  <div id="app" hidden>
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true"></div>
+        <div>
+          <div class="brand-name">Agenda</div>
+          <div class="brand-tag" id="top-fecha"></div>
+        </div>
+      </div>
+      <div class="top-actions">
+        <button class="sync" id="sync-btn" title="Estado de sincronización"><span class="dot"></span><span id="sync-text">—</span></button>
+        <button class="icon-btn" id="tema-btn" aria-label="Cambiar tema"></button>
+        <button class="icon-btn" id="ajustes-btn" aria-label="Ajustes"><i class="ic ic-gear"></i></button>
+      </div>
+    </header>
+    <div class="demo-banner" id="demo-banner" hidden>Modo demostración · los datos no se guardan</div>
+
+    <main id="vista" class="vista"></main>
+
+    <nav class="tabbar" id="tabbar">
+      <button data-tab="inicio" class="active"><i class="ic ic-home"></i><span>Inicio</span></button>
+      <button data-tab="viajes"><i class="ic ic-list"></i><span>Viajes</span></button>
+      <button data-tab="nuevo" class="tab-plus" aria-label="Nuevo viaje"><i class="ic ic-plus"></i></button>
+      <button data-tab="resumen"><i class="ic ic-chart"></i><span>Resumen</span></button>
+      <button data-tab="clientes"><i class="ic ic-users"></i><span>Clientes</span></button>
+    </nav>
+  </div>
+
+  <!-- Hoja modal (formularios) -->
+  <div class="sheet-wrap" id="sheet-wrap" hidden>
+    <div class="sheet-backdrop" data-cerrar></div>
+    <section class="sheet" id="sheet" role="dialog" aria-modal="true"></section>
+  </div>
+
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>
