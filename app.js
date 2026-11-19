@@ -1,9 +1,9 @@
 /* =========================================================
-   Agenda de Viajes · lógica de la aplicación
+   Ganancias infinitas · lógica de la aplicación
    ========================================================= */
 'use strict';
 
-const VERSION = '1.0.0';
+const VERSION = '1.1.0';
 
 /* ---------- Utilidades ---------- */
 const $ = (s, r = document) => r.querySelector(s);
@@ -280,7 +280,6 @@ function abrirApp() {
   $('#login').hidden = true;
   $('#app').hidden = false;
   $('#demo-banner').hidden = !S.demo;
-  $('#top-fecha').textContent = diaLargo(hoyStr());
   irA(S.tab || 'inicio');
   pintarSync();
 }
@@ -549,7 +548,7 @@ function render() {
 function vistaInicio() {
   const h = hoyStr();
   const hora = new Date().getHours();
-  const saludo = hora < 12 ? 'Buenos días' : hora < 20 ? 'Buenas tardes' : 'Buenas noches';
+  const saludo = (hora >= 6 && hora < 12 ? 'Buen día' : hora >= 12 && hora < 20 ? 'Buenas tardes' : 'Buenas noches') + ', Estrella';
   const c = calcular([h, h]);
   const proximos = S.viajes.filter(v => v.estado !== 'realizado').sort((a, b) => (a.pickup || '9').localeCompare(b.pickup || '9'));
   const t = estadoTanque();
@@ -1287,7 +1286,7 @@ let ultimaVisible = 0;
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible' && Date.now() - ultimaVisible > 30000) {
     ultimaVisible = Date.now(); aplicarTema();
-    if (!$('#app').hidden) { $('#top-fecha').textContent = diaLargo(hoyStr()); sincronizar(); if (!S.sheetAbierta) render(); }
+    if (!$('#app').hidden) { sincronizar(); if (!S.sheetAbierta) render(); }
   }
 });
 setInterval(() => { if (S.cola.length) flush(); }, 60000);
