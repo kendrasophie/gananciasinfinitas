@@ -3,7 +3,7 @@
    ========================================================= */
 'use strict';
 
-const VERSION = '1.1.0';
+const VERSION = '1.2.0';
 
 /* ---------- Utilidades ---------- */
 const $ = (s, r = document) => r.querySelector(s);
@@ -82,8 +82,22 @@ const CONFIG_DEF = {
   cotFecha: '',
   coordinador: '5491132693757',
   meta: null,
-  comb: { activo: false, capacidad: null, autonomia: null, factor: 1.5 }
+  comb: { activo: true, vehiculo: 'Volkswagen Taos Comfortline', capacidad: 50, autonomia: 670, factor: 1, v: 2 },
+  base: {
+    estacionamiento: 'Luis María Campos 2245',
+    domicilio: 'Italia 339, Villa Granaderos de San Martín (CP 1651)',
+    minutosRetiro: 15
+  },
+  // Distancias aproximadas desde la base (ida). Editables en Ajustes.
+  lugares: [
+    { id: 'l1', nombre: 'Aeropuerto Ezeiza', km: 45, min: 50 },
+    { id: 'l2', nombre: 'Aeroparque Jorge Newbery', km: 20, min: 35 },
+    { id: 'l3', nombre: 'Ciudad Autónoma de Buenos Aires', km: 20, min: 40 },
+    { id: 'l4', nombre: 'Microcentro', km: 22, min: 45 },
+    { id: 'l5', nombre: 'Devoto', km: 10, min: 20 }
+  ]
 };
+const TAOS = { vehiculo: 'Volkswagen Taos Comfortline', capacidad: 50, autonomia: 670 };
 
 /* ---------- Estado ---------- */
 const S = {
@@ -110,6 +124,12 @@ function mergeConfig(c) {
   if (!c) return out;
   Object.assign(out, c);
   out.comb = Object.assign(clone(CONFIG_DEF.comb), c.comb || {});
+  if (!out.comb.v) {            // migración a v2: datos de la Taos y km sin pasajero explícitos
+    if (!num(out.comb.capacidad)) Object.assign(out.comb, TAOS, { activo: true });
+    out.comb.factor = 1; out.comb.v = 2;
+  }
+  out.base = Object.assign(clone(CONFIG_DEF.base), c.base || {});
+  if (!Array.isArray(out.lugares)) out.lugares = clone(CONFIG_DEF.lugares);
   if (!Array.isArray(out.tramos)) out.tramos = clone(CONFIG_DEF.tramos);
   return out;
 }
@@ -117,19 +137,46 @@ function mergeConfig(c) {
 /* Normaliza lo que llega de la hoja */
 function normViaje(v) {
   const n = Object.assign({}, v);
-  ['pasajeros', 'km', 'monto', 'propinaMonto', 'peajeMonto', 'aguaCant', 'toallitasCant', 'cotUSD', 'cotEUR', 'demoraMin'].forEach(k => n[k] = num(n[k]));
+  ['pasajeros', 'km', 'kmVacio', 'monto', 'propinaMonto', 'peajeMonto', 'aguaCant', 'toallitasCant', 'cotUSD', 'cotEUR', 'demoraMin'].forEach(k => n[k] = num(n[k]));
   ['propina', 'peaje', 'combustible', 'agua', 'toallitas'].forEach(k => n[k] = bool(n[k]));
-  n.estado = n.estado === 'realizado' ? 'realizado' : 'agendado';
+  n.estado = ['realizado', 'cancelado'].includes(n.estado) ? n.estado : 'agendado';
+  n.base = n.base === 'domicilio' ? 'domicilio' : 'estacionamiento';
+  n.motivoCancelacion = n.motivoCancelacion || '';
   n.pago = n.pago === 'cobrado' ? 'cobrado' : 'pendiente';
   n.id = String(n.id);
   return n;
 }
 function normCarga(c) {
   const n = Object.assign({}, c);
-  ['litros', 'monto', 'odometro', 'cotUSD'].forEach(k => n[k] = num(n[k]));
+  ['litros', 'monto', 'odometro', 'cotUSD', 'nivel'].forEach(k => n[k] = num(n[k]));
   n.lleno = bool(n.lleno);
   n.id = String(n.id);
   return n;
+}
+
+/* ---------- Lugares y distancias desde la base ---------- */
+const normTxt = t => String(t || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9 ]/g, ' ').replace(/\s+/g, ' ').trim();
+function lugarDe(nombre) {
+  const n = normTxt(nombre);
+  if (n.length < 3) return null;
+  const ls = S.config.lugares || [];
+  return ls.find(l => normTxt(l.nombre) === n) || ls.find(l => { const m = normTxt(l.nombre); return m.length >= 4 && (n.includes(m) || m.includes(n)); }) || null;
+}
+/* Km sin pasajero: de la base al origen + del destino a la base */
+function kmVacioSugerido(origen, destino) {
+  const a = lugarDe(origen), b = lugarDe(destino);
+  if (!a || !b || a.km == null || b.km == null) return null;
+  return Math.round(a.km + b.km);
+}
+/* Km totales que hace la Taos en un viaje */
+const kmTotal = v => (v.km || 0) + (v.kmVacio != null ? v.kmVacio : (v.km || 0));
+/* Hora sugerida para salir de casa */
+function salidaSugerida(v) {
+  if (!v.pickup) return null;
+  const l = lugarDe(v.origen);
+  const min = (l && l.min != null ? l.min : 30) + (v.base !== 'domicilio' ? (num(S.config.base.minutosRetiro) || 0) : 0);
+  const d = new Date(toDate(v.pickup).getTime() - min * 6e4);
+  return { hora: d.toTimeString().slice(0, 5), min, estimado: !l };
 }
 
 /* ---------- Comunicación con el servidor ---------- */
@@ -343,7 +390,8 @@ function aUSD(monto, moneda, cotUSD, cotEUR) {
 function calcular(r) {
   const vs = S.viajes.filter(v => enRango(fechaViaje(v), r));
   const real = vs.filter(v => v.estado === 'realizado');
-  const agend = vs.filter(v => v.estado !== 'realizado');
+  const agend = vs.filter(v => v.estado === 'agendado');
+  const cancelados = vs.filter(v => v.estado === 'cancelado');
   const cobrado = sum(real.filter(v => v.pago === 'cobrado'), v => v.monto);
   const pendiente = sum(real.filter(v => v.pago !== 'cobrado'), v => v.monto);
   const prop = { USD: 0, ARS: 0, EUR: 0 };
@@ -366,7 +414,7 @@ function calcular(r) {
   const facturado = cobrado + pendiente;
   const total = facturado + (S.propinasEnTotal ? propUSD : 0);
   return {
-    vs, real, agend, cobrado, pendiente, facturado, prop, propUSD, propFalta, total,
+    vs, real, agend, cancelados, cobrado, pendiente, facturado, prop, propUSD, propFalta, total,
     peajesARS, combARS, gastosUSD, gastosFalta, neto: total - gastosUSD,
     pasajeros: sum(real, v => v.pasajeros), botellas: sum(real.filter(v => v.agua), v => v.aguaCant),
     toallitas: sum(real.filter(v => v.toallitas), v => v.toallitasCant),
@@ -375,46 +423,61 @@ function calcular(r) {
   };
 }
 
-/* Combustible: estimación del tanque */
+/* Combustible: estimación del tanque y avisos según la agenda */
 function estadoTanque() {
   const cfg = S.config.comb || {};
   if (!cfg.activo) return null;
   const cap = num(cfg.capacidad);
   const cs = S.cargas.filter(c => c.fecha).slice().sort((a, b) => a.fecha.localeCompare(b.fecha));
-  const kmViajes = (desde, hasta) => sum(S.viajes.filter(v => v.estado === 'realizado' && v.km && (v.pickup || '') > desde && (v.pickup || '') <= hasta), v => v.km);
+  const kmViajes = (desde, hasta) => sum(S.viajes.filter(v => v.estado === 'realizado' && (v.pickup || '') > desde && (v.pickup || '') <= hasta), kmTotal);
+  // Corrección aprendida con el odómetro (km reales / km calculados)
   const ratios = [];
   for (let i = 1; i < cs.length; i++) {
     const a = cs[i - 1], b = cs[i];
-    if (a.odometro && b.odometro && b.odometro > a.odometro) { const kv = kmViajes(a.fecha, b.fecha); if (kv > 0) ratios.push((b.odometro - a.odometro) / kv); }
+    if (a.odometro && b.odometro && b.odometro > a.odometro) { const kv = kmViajes(a.fecha, b.fecha); if (kv > 20) ratios.push((b.odometro - a.odometro) / kv); }
   }
-  const factor = ratios.length ? Math.min(4, Math.max(1, avg(ratios.slice(-3)))) : (num(cfg.factor) || 1.5);
+  const factor = ratios.length ? Math.min(2.5, Math.max(0.7, avg(ratios.slice(-3)))) : (num(cfg.factor) || 1);
   const kmEntre = (a, b) => (a.odometro && b.odometro && b.odometro > a.odometro) ? b.odometro - a.odometro : kmViajes(a.fecha, b.fecha) * factor;
+  // Rendimiento medido entre dos tanques llenos
   const llenos = cs.map((c, i) => c.lleno ? i : -1).filter(i => i >= 0);
   const rends = [];
   for (let k = 1; k < llenos.length; k++) {
     const i = llenos[k - 1], j = llenos[k];
     let litros = 0, km = 0;
     for (let x = i + 1; x <= j; x++) { litros += cs[x].litros || 0; km += kmEntre(cs[x - 1], cs[x]); }
-    if (litros > 0 && km > 0) rends.push(km / litros);
+    if (litros > 5 && km > 20) rends.push(km / litros);
   }
   const rendCfg = cap && num(cfg.autonomia) ? num(cfg.autonomia) / cap : null;
   const rend = rends.length ? avg(rends.slice(-3)) : rendCfg;
+  const ancla = cs.findIndex(c => c.lleno || c.nivel != null);
   const falta = [];
   if (!cap) falta.push('la capacidad del tanque');
   if (!rend) falta.push('la autonomía con tanque lleno');
-  if (!llenos.length) falta.push('una carga marcada como tanque lleno');
   if (falta.length) return { falta };
-  let nivel = cap;
-  for (let x = llenos[0] + 1; x < cs.length; x++) {
+  if (ancla < 0) return { sinNivel: true, cap, rend };
+  let nivel = cs[ancla].nivel != null ? cs[ancla].nivel : cap;
+  for (let x = ancla + 1; x < cs.length; x++) {
     nivel = Math.max(0, nivel - kmEntre(cs[x - 1], cs[x]) / rend);
-    nivel = cs[x].lleno ? cap : Math.min(cap, nivel + (cs[x].litros || 0));
+    if (cs[x].nivel != null) nivel = Math.min(cap, cs[x].nivel);
+    else nivel = cs[x].lleno ? cap : Math.min(cap, nivel + (cs[x].litros || 0));
   }
   const ult = cs[cs.length - 1];
-  const kmDesde = kmViajes(ult.fecha, nowLocal()) * factor;
+  const ahora = nowLocal();
+  const kmDesde = kmViajes(ult.fecha, ahora) * factor;
   nivel = Math.max(0, nivel - kmDesde / rend);
   const kmRest = nivel * rend;
+  const reserva = Math.max(50, cap * rend * 0.1);
+  // Agenda: viajes por hacer, en orden
+  const prox = S.viajes.filter(v => v.estado === 'agendado' && v.pickup).sort((a, b) => a.pickup.localeCompare(b.pickup));
+  let acum = 0, alerta = null;
+  prox.forEach(v => { acum += kmTotal(v) * factor; if (!alerta && kmRest - acum < reserva) alerta = v; });
   const ref = S.config.tramos.find(t => t.km) || null;
-  return { pct: nivel / cap, litros: nivel, kmRest, rend, factor, aprendido: rends.length > 0, ref, viajesRef: ref ? Math.floor(kmRest / (ref.km * factor)) : null, kmDesde, ult };
+  const kmRef = ref ? kmTotal({ km: ref.km, kmVacio: kmVacioSugerido(ref.origen, ref.destino) }) * factor : null;
+  return {
+    pct: nivel / cap, litros: nivel, kmRest, rend, factor, aprendido: rends.length > 0, ref, kmDesde, ult, reserva,
+    viajesRef: kmRef ? Math.floor(Math.max(0, kmRest - reserva) / kmRef) : null,
+    agenda: { n: prox.length, km: acum, alerta, alertaIds: alerta ? prox.slice(prox.indexOf(alerta)).map(v => v.id) : [] }
+  };
 }
 
 /* =========================================================
@@ -431,7 +494,7 @@ function badgePago(v) {
   return v.pago === 'cobrado' ? '<span class="badge b-azul">Cobrado</span>' : '<span class="badge b-lila">Pendiente</span>';
 }
 function tarjetaViaje(v, conAcciones = false) {
-  const ag = v.estado !== 'realizado';
+  const ag = v.estado === 'agendado', canc = v.estado === 'cancelado';
   let cuenta = '';
   if (ag && v.pickup) {
     const m = minutosEntre(nowLocal(), v.pickup);
@@ -439,21 +502,25 @@ function tarjetaViaje(v, conAcciones = false) {
     else if (m < 0) cuenta = `<span class="badge b-danger">Pick up ${relativo(m)}</span>`;
     else if (m < 24 * 60) cuenta = `<span class="countdown">${relativo(m)}</span>`;
   }
-  const iconos = [
+  const t = S._tanque;
+  const cargarAntes = ag && t && t.agenda && t.agenda.alertaIds.includes(v.id);
+  const sal = ag && !v.subio ? salidaSugerida(v) : null;
+  const iconos = canc ? '' : [
     v.pasajeros ? `${v.pasajeros} pax` : '',
     v.agua ? `💧${v.aguaCant || ''}` : '',
-    v.toallitas ? `🧻${v.toallitasCant || ''}` : '',
+    v.toallitas ? `🤧${v.toallitasCant || ''}` : '',
     v.peaje ? '🛣️' : '',
     v.combustible ? '⛽' : '',
     v.propina ? `<span class="gold-t">+ ${esc(v.propinaMoneda || 'USD')} ${fmt(v.propinaMonto)}</span>` : ''
   ].filter(Boolean).join(' · ');
+  const estadoBadge = canc ? '<span class="badge b-danger">Cancelado</span>' : ag ? '<span class="badge b-muted">Agendado</span>' : badgePago(v);
   return `
-  <article class="card trip" data-act="editar" data-id="${esc(v.id)}">
+  <article class="card trip ${canc ? 'cancelado' : ''}" data-act="editar" data-id="${esc(v.id)}">
     <div class="trip-top">
       <div class="trip-time">${hm(v.pickup)}<small>${ddmm(v.pickup)}</small></div>
       <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;justify-content:flex-end">
-        ${cuenta}${ag ? '<span class="badge b-muted">Agendado</span>' : badgePago(v)}
-        ${v.monto ? `<span class="trip-amt">${fmt(v.monto)}</span>` : ''}
+        ${cuenta}${estadoBadge}
+        ${v.monto && !canc ? `<span class="trip-amt">${fmt(v.monto)}</span>` : ''}
       </div>
     </div>
     <div class="trip-route">
@@ -466,7 +533,12 @@ function tarjetaViaje(v, conAcciones = false) {
       ${v.procTipo ? `<span class="badge b-lila">${esc(v.procDetalle || v.procTipo)}</span>` : ''}
       ${badgeDemora(v)}
       ${iconos ? `<span>${iconos}</span>` : ''}
+      ${canc && v.motivoCancelacion ? `<span>Motivo: ${esc(v.motivoCancelacion)}</span>` : ''}
     </div>
+    ${sal || cargarAntes ? `<div class="trip-meta" style="margin-top:8px">
+      ${sal ? `<span class="badge b-azul">Salir de casa ${sal.hora}${sal.estimado ? ' aprox.' : ''}</span><span>${v.base === 'domicilio' ? 'auto en casa' : 'retirar del estacionamiento'}</span>` : ''}
+      ${cargarAntes ? '<span class="badge b-danger">⛽ Cargar antes</span>' : ''}
+    </div>` : ''}
     ${conAcciones && ag ? `
     <div class="trip-actions">
       ${!v.subio ? `<button class="btn btn-gold btn-sm" data-act="subio" data-id="${esc(v.id)}">Subió el pasajero</button>` : ''}
@@ -489,22 +561,39 @@ function tarjetaTanque(t, compacta = false) {
   if (!t) return '';
   if (t.falta) {
     return `<div class="card"><div class="split"><div><div class="stat"><div class="lbl">Combustible</div></div>
-      <div class="note">Para estimar el tanque falta: ${t.falta.join(', ')}.</div></div>
+      <div class="note">Para estimar el tanque falta: ${t.falta.join(', ')}. Completalo en Ajustes.</div></div>
       <button class="btn btn-soft btn-sm" data-act="combustible"><i class="ic ic-fuel"></i></button></div></div>`;
+  }
+  if (t.sinNivel) {
+    return `<div class="card gold" data-act="combustible" style="cursor:pointer">
+      <div class="fuel"><div class="tank"><b>?</b></div>
+      <div><div class="stat"><div class="lbl">${esc(S.config.comb.vehiculo || 'Combustible')}</div></div>
+      <div style="font-family:var(--f-display);font-size:22px;font-weight:600;margin-top:2px">¿Cuánto combustible tiene ahora?</div>
+      <div class="note">Informalo una vez para empezar a medir el consumo y recibir avisos según tus viajes agendados.</div>
+      ${compacta ? '<button class="btn btn-gold btn-sm mt" data-act="combustible">Informar nivel actual</button>' : ''}</div></div>
+    </div>`;
   }
   const p = Math.round(t.pct * 100);
   const color = p <= 20 ? 'var(--danger)' : p <= 40 ? 'var(--gold)' : 'var(--azul)';
-  const estado = p <= 20 ? '<span class="badge b-danger">Cargá pronto</span>' : p <= 40 ? '<span class="badge b-gold">Conviene cargar</span>' : '<span class="badge b-azul">Bien</span>';
-  return `<div class="card ${p <= 40 ? 'gold' : ''}" data-act="combustible" style="cursor:pointer">
+  const a = t.agenda;
+  const alerta = a.alerta;
+  const estado = alerta || p <= 20 ? '<span class="badge b-danger">Cargá pronto</span>' : p <= 40 ? '<span class="badge b-gold">Conviene cargar</span>' : '<span class="badge b-azul">Bien</span>';
+  const lineaAgenda = a.n
+    ? (alerta
+      ? `<div class="note mt" style="color:var(--danger)"><b>⛽ Cargá antes del viaje del ${ddmm(alerta.pickup)} a las ${hm(alerta.pickup)}</b> (${esc(alerta.origen || '')} → ${esc(alerta.destino || '')}). Tus ${a.n} viaje${a.n === 1 ? '' : 's'} agendado${a.n === 1 ? '' : 's'} necesitan ~${fmt(a.km)} km.</div>`
+      : `<div class="note mt">✓ Alcanza para tus ${a.n} viaje${a.n === 1 ? '' : 's'} agendado${a.n === 1 ? '' : 's'} (~${fmt(a.km)} km), dejando reserva.</div>`)
+    : '';
+  return `<div class="card ${alerta || p <= 40 ? 'gold' : ''}" data-act="combustible" style="cursor:pointer">
     <div class="fuel">
       <div class="tank"><span style="height:${p}%;background:${color};opacity:.85"></span><b>${p}%</b></div>
       <div>
         <div class="split"><div class="stat"><div class="lbl">Tanque estimado</div></div>${estado}</div>
-        <div style="font-family:var(--f-display);font-size:24px;font-weight:600;margin-top:2px">≈ ${fmt(t.kmRest)} km</div>
-        <div class="note">${t.ref && t.viajesRef !== null ? `Alcanza para ~${t.viajesRef} viaje${t.viajesRef === 1 ? '' : 's'} como ${esc(t.ref.origen)} → ${esc(t.ref.destino)}` : ''}
-        ${compacta ? '' : `<br>Rendimiento ${t.aprendido ? 'medido' : 'estimado'}: ${fmt(t.rend)} km/l`}</div>
+        <div style="font-family:var(--f-display);font-size:24px;font-weight:600;margin-top:2px">≈ ${fmt(t.kmRest)} km <span class="muted" style="font-size:16px">· ${fmt(t.litros)} L</span></div>
+        <div class="note">${t.ref && t.viajesRef !== null ? `~${t.viajesRef} viaje${t.viajesRef === 1 ? '' : 's'} como ${esc(t.ref.origen)} → ${esc(t.ref.destino)} (con ida y vuelta desde la base)` : ''}
+        ${compacta ? '' : `<br>Rendimiento ${t.aprendido ? 'medido' : 'de fábrica'}: ${fmt(t.rend)} km/l`}</div>
       </div>
     </div>
+    ${lineaAgenda}
   </div>`;
 }
 
@@ -539,6 +628,7 @@ function irA(tab) {
 function render() {
   const v = $('#vista');
   if (!v || $('#app').hidden) return;
+  S._tanque = estadoTanque();
   const vistas = { inicio: vistaInicio, viajes: vistaViajes, resumen: vistaResumen, clientes: vistaClientes, ajustes: vistaAjustes };
   v.innerHTML = (vistas[S.tab] || vistaInicio)();
   if (S.tab === 'viajes') pintarListaViajes();
@@ -548,10 +638,10 @@ function render() {
 function vistaInicio() {
   const h = hoyStr();
   const hora = new Date().getHours();
-  const saludo = (hora >= 6 && hora < 12 ? 'Buen día' : hora >= 12 && hora < 20 ? 'Buenas tardes' : 'Buenas noches') + ', Estrella';
+  const saludo = (hora >= 6 && hora < 12 ? 'Good morning' : hora >= 12 && hora < 20 ? 'Good afternoon' : 'Good evening') + ', Estrella';
   const c = calcular([h, h]);
-  const proximos = S.viajes.filter(v => v.estado !== 'realizado').sort((a, b) => (a.pickup || '9').localeCompare(b.pickup || '9'));
-  const t = estadoTanque();
+  const proximos = S.viajes.filter(v => v.estado === 'agendado').sort((a, b) => (a.pickup || '9').localeCompare(b.pickup || '9'));
+  const t = S._tanque;
   return `
   <div class="page-head"><div><h1 class="h-page">${saludo}</h1><div class="h-sub">${diaLargo(h).replace(/^./, x => x.toUpperCase())}</div></div></div>
   <div class="grid2 mt2">
@@ -593,7 +683,7 @@ function pintarListaViajes() {
 function vistaResumen() {
   const r = rango(S.fResumen);
   const c = calcular(r);
-  const t = estadoTanque();
+  const t = S._tanque;
   const maxProc = Math.max(1, ...Object.values(c.proc));
   const cot = S.config.cotUSD;
   const noCot = '<span class="muted" style="font-weight:500">sin cotización</span>';
@@ -604,7 +694,7 @@ function vistaResumen() {
     <div class="split"><div class="lbl">Total del período</div>
       <div class="seg" style="width:auto;padding:2px"><button class="${S.propinasEnTotal ? 'on' : ''}" style="padding:5px 10px;font-size:12px" data-act="propTotal" data-v="1">Con propinas</button><button class="${!S.propinasEnTotal ? 'on' : ''}" style="padding:5px 10px;font-size:12px" data-act="propTotal" data-v="0">Sin propinas</button></div></div>
     <div class="big"><small>USD</small>${fmt(c.total)}</div>
-    <div class="sub">${c.real.length} viaje${c.real.length === 1 ? '' : 's'} realizado${c.real.length === 1 ? '' : 's'}${c.agend.length ? ` · ${c.agend.length} agendado${c.agend.length === 1 ? '' : 's'} (${money(c.previsto)} previstos)` : ''}</div>
+    <div class="sub">${c.real.length} viaje${c.real.length === 1 ? '' : 's'} realizado${c.real.length === 1 ? '' : 's'}${c.agend.length ? ` · ${c.agend.length} agendado${c.agend.length === 1 ? '' : 's'} (${money(c.previsto)} previstos)` : ''}${c.cancelados.length ? ` · ${c.cancelados.length} cancelado${c.cancelados.length === 1 ? '' : 's'}` : ''}</div>
     ${S.propinasEnTotal && c.propFalta ? '<div class="note mt">Hay propinas en ARS o EUR que no se suman porque falta la cotización (Ajustes).</div>' : ''}
   </div>
   <div class="grid2 mt">
@@ -636,7 +726,7 @@ function vistaResumen() {
     <div class="card stat"><div class="lbl">Pasajeros</div><div class="val">${c.pasajeros}</div></div>
     <div class="card stat c-azul"><div class="lbl">Puntual</div><div class="val">${c.conDemora ? Math.round(c.aTiempo / c.conDemora * 100) + '%' : '—'}</div></div>
     <div class="card stat"><div class="lbl">Botellas</div><div class="val">${c.botellas}</div></div>
-    <div class="card stat"><div class="lbl">Toallitas</div><div class="val">${c.toallitas}</div></div>
+    <div class="card stat"><div class="lbl">Pañuelos</div><div class="val">${c.toallitas}</div></div>
     <div class="card stat c-lila"><div class="lbl">Demora prom.</div><div class="val">${c.demoraProm === null ? '—' : Math.round(c.demoraProm)}<small>${c.demoraProm === null ? '' : 'min'}</small></div></div>
   </div>
 
@@ -749,20 +839,38 @@ function vistaAjustes() {
     <div class="btn-row"><button class="btn btn-gold" data-act="guardarMeta">Guardar meta</button>${cfg.meta ? '<button class="btn btn-soft" data-act="quitarMeta">Quitar</button>' : ''}</div>
   </div>
 
-  <h3 class="h-sec">Combustible</h3>
+  <h3 class="h-sec">Vehículo y combustible</h3>
   <div class="card">
-    <span class="flabel">Indicador del tanque</span>
-    <div class="seg" style="margin-bottom:14px"><button class="${cb.activo ? 'on' : ''}" data-act="combActivo" data-v="1">Activado</button><button class="${!cb.activo ? 'on' : ''}" data-act="combActivo" data-v="0">Desactivado</button></div>
+    <label class="field"><span>Vehículo</span><input id="comb-veh" value="${esc(cb.vehiculo || '')}"></label>
     <div class="fpair">
-      <label class="field"><span>Capacidad del tanque</span><div class="money"><span class="cur">L</span><input id="comb-cap" inputmode="decimal" value="${esc(cb.capacidad ?? '')}" placeholder="Ej.: 50"></div></label>
-      <label class="field"><span>Autonomía con tanque lleno</span><div class="money"><span class="cur">KM</span><input id="comb-aut" inputmode="decimal" value="${esc(cb.autonomia ?? '')}" placeholder="Ej.: 600"></div></label>
+      <label class="field"><span>Capacidad del tanque</span><div class="money"><span class="cur">L</span><input id="comb-cap" inputmode="decimal" value="${esc(cb.capacidad ?? '')}"></div></label>
+      <label class="field"><span>Autonomía de fábrica</span><div class="money"><span class="cur">KM</span><input id="comb-aut" inputmode="decimal" value="${esc(cb.autonomia ?? '')}"></div></label>
     </div>
-    <label class="field"><span>Km extra sin pasajero (ir a buscar, volver)</span>
-      <select id="comb-factor">${[[1, 'Ninguno'], [1.25, '+25 %'], [1.5, '+50 %'], [1.75, '+75 %'], [2, '+100 % (ida y vuelta vacío)']].map(([v, n]) => `<option value="${v}" ${Number(cb.factor || 1.5) === v ? 'selected' : ''}>${n}</option>`).join('')}</select>
-      <small>Si anotás los km del tablero al cargar, la app aprende este valor sola.</small></label>
-    ${t && !t.falta ? `<div class="note" style="margin:-2px 0 12px">Rendimiento ${t.aprendido ? 'medido' : 'estimado'}: <b>${fmt(t.rend)} km/l</b> · factor ${fmt(t.factor)}</div>` : ''}
-    <button class="btn btn-soft btn-block" data-act="guardarComb">Guardar combustible</button>
+    <div class="note" style="margin:-4px 0 12px">Taos Comfortline: tanque de 50 L y unos 670 km en uso mixto (7,5 L cada 100 km). En ciudad rinde menos. Con las cargas de tanque lleno la app mide el consumo real y deja de usar el dato de fábrica.</div>
+    ${t && t.rend ? `<div class="note" style="margin:0 0 12px">Rendimiento en uso: <b>${fmt(t.rend)} km/l</b> (${t.aprendido ? 'medido con tus cargas' : 'de fábrica'})${t.factor && Math.abs(t.factor - 1) > 0.02 ? ` · corrección por odómetro ×${fmt(t.factor)}` : ''}</div>` : ''}
+    <span class="flabel">Indicador del tanque y avisos</span>
+    <div class="seg" style="margin-bottom:14px"><button class="${cb.activo ? 'on' : ''}" data-act="combActivo" data-v="1">Activado</button><button class="${!cb.activo ? 'on' : ''}" data-act="combActivo" data-v="0">Desactivado</button></div>
+    <button class="btn btn-soft btn-block" data-act="guardarComb">Guardar vehículo</button>
   </div>
+
+  <h3 class="h-sec">Base del vehículo</h3>
+  <div class="card">
+    <label class="field"><span>Estacionamiento</span><input id="base-est" value="${esc(S.config.base.estacionamiento)}"></label>
+    <label class="field"><span>Domicilio</span><input id="base-dom" value="${esc(S.config.base.domicilio)}"></label>
+    <label class="field"><span>Minutos para retirar el auto del estacionamiento</span><div class="money"><span class="cur">MIN</span><input id="base-min" inputmode="numeric" value="${esc(S.config.base.minutosRetiro ?? '')}"></div><small>Incluye ir desde tu casa con el auto personal. Se suma a la hora de salida sugerida.</small></label>
+    <button class="btn btn-soft btn-block" data-act="guardarBase">Guardar base</button>
+  </div>
+
+  <h3 class="h-sec">Distancias desde la base</h3>
+  <div class="note" style="margin:-2px 2px 10px">Km y minutos de ida desde la base a cada lugar. Con esto la app calcula los km sin pasajero de cada viaje (ir a buscar y volver) y la hora sugerida de salida. Son aproximados: corregilos con lo que veas en la práctica.</div>
+  <div class="card list-card">
+    ${(S.config.lugares || []).map(l => `
+      <div class="tramo-item">
+        <div><div class="r">${esc(l.nombre)}</div><div class="s">≈ ${fmt(l.km)} km · ${fmt(l.min)} min</div></div>
+        <button class="btn btn-soft btn-sm" data-act="editarLugar" data-id="${esc(l.id)}">Editar</button>
+      </div>`).join('')}
+  </div>
+  <button class="btn btn-ghost btn-block mt" data-act="editarLugar">Agregar lugar</button>
 
   <h3 class="h-sec">Conexión</h3>
   <div class="card"><div class="rows">
@@ -808,7 +916,8 @@ function nuevoViaje() {
     cliente: '', procTipo: '', procDetalle: '', pasajeros: 1, tramo: '', origen: '', destino: '', km: null,
     monto: null, pago: 'pendiente', propina: false, propinaMonto: null, propinaMoneda: 'USD',
     peaje: false, peajeMonto: null, combustible: false, agua: false, aguaCant: null, toallitas: false, toallitasCant: null,
-    cotUSD: null, cotEUR: null, notas: '', creado: '', actualizado: ''
+    cotUSD: null, cotEUR: null, notas: '', creado: '', actualizado: '',
+    base: 'estacionamiento', kmVacio: null, motivoCancelacion: ''
   };
 }
 function seg(name, opciones, valor, clase = '') {
@@ -838,14 +947,20 @@ function abrirEditor(id, finalizar = false) {
   const clientes = [...new Set(S.viajes.map(v => (v.cliente || '').trim()).filter(Boolean))].sort();
   const tramoSel = d.tramo && S.config.tramos.some(t => t.id === d.tramo) ? d.tramo : (d.origen || d.destino ? 'otro' : '');
   d.tramo = tramoSel;
+  const sug = kmVacioSugerido(d.origen, d.destino);
+  S.kmVacioManual = !!existente && d.kmVacio != null && d.kmVacio !== sug;
+  const canc = d.estado === 'cancelado';
   abrirSheet(`
   <form id="form-viaje" autocomplete="off" onsubmit="return false">
-    <div class="sheet-head"><h2>${nuevo ? 'Nuevo viaje' : d.estado === 'realizado' ? 'Viaje realizado' : 'Viaje agendado'}</h2><button type="button" class="icon-btn" data-cerrar><i class="ic ic-close"></i></button></div>
+    <div class="sheet-head"><h2>${nuevo ? 'Nuevo viaje' : d.estado === 'realizado' ? 'Viaje realizado' : canc ? 'Viaje cancelado' : 'Viaje agendado'}</h2><button type="button" class="icon-btn" data-cerrar><i class="ic ic-close"></i></button></div>
 
     <div class="fgroup">
       <div class="fgroup-t">Horarios</div>
       <label class="field"><span>Toma de conocimiento</span><input type="datetime-local" data-f="conocimiento" value="${esc(d.conocimiento)}"></label>
       <label class="field"><span>Pick up pactado</span><input type="datetime-local" data-f="pickup" value="${esc(d.pickup)}"></label>
+      <span class="flabel">La Taos sale desde</span>
+      <div style="margin-bottom:8px">${seg('base', [['estacionamiento', 'Estacionamiento'], ['domicilio', 'Domicilio']], d.base)}</div>
+      <div class="hint" id="salida" style="margin:0 0 14px"></div>
       <label class="field"><span>Subió el pasajero</span>
         <div class="with-btn"><input type="datetime-local" data-f="subio" value="${esc(d.subio)}"><button type="button" class="btn btn-gold btn-sm" data-act="subioAhora">Ahora</button></div></label>
       <div class="delay" id="delay"></div>
@@ -869,7 +984,8 @@ function abrirEditor(id, finalizar = false) {
       </select></label>
       <label class="field"><span>Desde</span><input data-f="origen" list="dl-lugares" value="${esc(d.origen)}" placeholder="Origen"></label>
       <label class="field"><span>Hasta</span><input data-f="destino" list="dl-lugares" value="${esc(d.destino)}" placeholder="Destino"></label>
-      <label class="field"><span>Distancia aproximada</span><div class="money"><span class="cur">KM</span><input data-f="km" inputmode="decimal" value="${esc(d.km ?? '')}"></div><small>Sirve para estimar el combustible.</small></label>
+      <label class="field"><span>Distancia aproximada</span><div class="money"><span class="cur">KM</span><input data-f="km" inputmode="decimal" value="${esc(d.km ?? '')}"></div><small>Con pasajero, de origen a destino.</small></label>
+      <label class="field"><span>Km sin pasajero (desde la base y vuelta)</span><div class="money"><span class="cur">KM</span><input data-f="kmVacio" inputmode="decimal" value="${esc(d.kmVacio ?? '')}"></div><small id="kmvacio-info"></small></label>
       <button type="button" class="btn btn-ghost btn-sm" id="btn-guardar-tramo" data-act="guardarComoTramo" style="margin:-4px 0 14px" ${tramoSel === 'otro' ? '' : 'hidden'}>Guardar como tramo fijo (ida y vuelta)</button>
     </div>
 
@@ -897,7 +1013,7 @@ function abrirEditor(id, finalizar = false) {
       <div style="margin-bottom:14px">${seg('combustible', YN, String(d.combustible), 'yn')}</div>
       <span class="flabel">Agua mineral (botellas)</span>
       <div class="yn-line">${seg('agua', YN, String(d.agua), 'yn')}${stepper('aguaCant', d.aguaCant, !d.agua)}</div>
-      <span class="flabel">Toallitas descartables</span>
+      <span class="flabel">Pañuelos descartables</span>
       <div class="yn-line">${seg('toallitas', YN, String(d.toallitas), 'yn')}${stepper('toallitasCant', d.toallitasCant, !d.toallitas)}</div>
     </div>
 
@@ -912,12 +1028,17 @@ function abrirEditor(id, finalizar = false) {
     <div class="sheet-foot">
       ${d.estado === 'realizado'
       ? `<button type="button" class="btn btn-gold btn-block" data-act="guardarViaje">Guardar cambios</button>`
-      : `<div class="btn-row"><button type="button" class="btn btn-ghost" data-act="guardarViaje">${nuevo ? 'Agendar' : 'Guardar'}</button><button type="button" class="btn btn-gold" data-act="finalizarViaje">Finalizar viaje</button></div>`}
+      : canc
+        ? `<div class="btn-row"><button type="button" class="btn btn-ghost" data-act="guardarViaje">Guardar</button><button type="button" class="btn btn-gold" data-act="reactivarViaje">Reactivar viaje</button></div>`
+        : `<div class="btn-row"><button type="button" class="btn btn-ghost" data-act="guardarViaje">${nuevo ? 'Agendar' : 'Guardar'}</button><button type="button" class="btn btn-gold" data-act="finalizarViaje">Finalizar viaje</button></div>`}
+      ${!nuevo && d.estado === 'agendado' ? `<button type="button" class="btn btn-lila btn-block" data-act="cancelarViaje">Cancelar viaje (el cliente canceló)</button>` : ''}
       ${!nuevo ? `<div class="btn-row"><button type="button" class="btn btn-wa btn-sm" data-act="wa" data-id="${esc(d.id)}"><i class="ic ic-wa"></i> Enviar al coordinador</button><button type="button" class="btn btn-danger btn-sm" data-act="borrarViaje" style="flex:0 0 auto">Eliminar</button></div>` : ''}
     </div>
   </form>`);
   actualizarDemora();
   infoCliente();
+  recalcVacio();
+  actualizarSalida();
   if (finalizar) setTimeout(() => $('.sheet-foot [data-act="finalizarViaje"]')?.scrollIntoView({ block: 'end' }), 50);
 }
 
@@ -925,6 +1046,20 @@ function actualizarDemora() {
   const el = $('#delay'); if (!el || !S.draft) return;
   const d = S.draft;
   el.innerHTML = d.pickup && d.subio ? `${badgeDemora(d)} <span class="note">pick up ${hm(d.pickup)} · subió ${hm(d.subio)}</span>` : '';
+}
+function actualizarSalida() {
+  const el = $('#salida'); if (!el || !S.draft) return;
+  const d = S.draft, b = S.config.base;
+  const lugar = d.base === 'domicilio' ? b.domicilio : b.estacionamiento;
+  const sal = salidaSugerida(d);
+  el.innerHTML = `Sale desde <b>${esc(lugar)}</b>.` + (sal ? ` Salida sugerida de casa: <b class="gold-t">${sal.hora} h</b> (${sal.min} min antes${d.base !== 'domicilio' ? ', incluye retirar el auto' : ''}${sal.estimado ? '; origen sin distancia cargada, se usan 30 min' : ''}).` : '');
+}
+function recalcVacio() {
+  const d = S.draft, info = $('#kmvacio-info'); if (!d || !info) return;
+  const sug = kmVacioSugerido(d.origen, d.destino);
+  if (!S.kmVacioManual && sug != null) setCampo('kmVacio', sug);
+  if (sug != null) info.innerHTML = S.kmVacioManual && d.kmVacio !== sug ? `Cargado a mano. Calculado: ${sug} km <a href="#" data-act="usarVacio" class="gold-t">usar</a>` : `Base → ${esc(d.origen)} + ${esc(d.destino)} → base`;
+  else info.textContent = 'Si lo dejás vacío se estima igual a la distancia del viaje. Podés cargar las distancias de cada lugar en Ajustes.';
 }
 function infoCliente() {
   const el = $('#cli-info'); if (!el || !S.draft) return;
@@ -956,6 +1091,7 @@ function onSegDraft(name, v) {
   if (name === 'peaje') { habilitar(['peajeMonto'], val); if (!val) setCampo('peajeMonto', null); else $('#sheet [data-f="peajeMonto"]').focus(); }
   if (name === 'agua') { habilitar(['aguaCant'], val); setCampo('aguaCant', val ? (d.aguaCant || 1) : null); }
   if (name === 'toallitas') { habilitar(['toallitasCant'], val); setCampo('toallitasCant', val ? (d.toallitasCant || 1) : null); }
+  if (name === 'base') actualizarSalida();
   if (name === 'procTipo') {
     d.procDetalle = '';
     $('#proc-detalle').innerHTML = campoProcedencia(d);
@@ -964,10 +1100,11 @@ function onSegDraft(name, v) {
 
 function onCampoDraft(el) {
   const name = el.dataset.f, d = S.draft; if (!d) return;
-  const numericos = ['km', 'monto', 'propinaMonto', 'peajeMonto', 'pasajeros', 'aguaCant', 'toallitasCant'];
+  const numericos = ['km', 'kmVacio', 'monto', 'propinaMonto', 'peajeMonto', 'pasajeros', 'aguaCant', 'toallitasCant'];
   d[name] = numericos.includes(name) ? num(el.value) : el.value;
   S.draftDirty = true;
-  if (name === 'pickup' || name === 'subio') actualizarDemora();
+  if (name === 'pickup' || name === 'subio') { actualizarDemora(); actualizarSalida(); }
+  if (name === 'kmVacio' && el === document.activeElement) S.kmVacioManual = true;
   if (name === 'cliente') {
     infoCliente();
     const prev = S.viajes.filter(v => (v.cliente || '').trim().toLowerCase() === el.value.trim().toLowerCase()).sort((a, b) => (b.pickup || '').localeCompare(a.pickup || ''))[0];
@@ -987,6 +1124,7 @@ function onCampoDraft(el) {
     const t = S.config.tramos.find(x => x.id === d.tramo);
     if (t && (d.origen !== t.origen || d.destino !== t.destino)) { d.tramo = 'otro'; $('#sheet [data-f="tramo"]').value = 'otro'; $('#btn-guardar-tramo').hidden = false; }
   }
+  if (name === 'origen' || name === 'destino' || name === 'tramo') { recalcVacio(); actualizarSalida(); }
 }
 
 function guardarViaje(finalizar = false) {
@@ -1041,6 +1179,15 @@ function abrirFinalizado(v) {
 function mensajeWA(v) {
   const sn = (b, extra) => b ? `Sí${extra ? ` (${extra})` : ''}` : 'No';
   const l = [];
+  if (v.estado === 'cancelado') {
+    l.push('❌ *Viaje cancelado*');
+    if (v.pickup) l.push(`📅 ${diaLargo(v.pickup.slice(0, 10)).replace(/^./, x => x.toUpperCase())}`);
+    l.push(`🕐 Pick up asignado: ${hm(v.pickup)} h`);
+    l.push(`📍 Desde: ${v.origen || '—'}`);
+    l.push(`🏁 Hasta: ${v.destino || '—'}`);
+    if (v.motivoCancelacion) l.push(`📝 Motivo: ${v.motivoCancelacion}`);
+    return l.join('\n');
+  }
   l.push(v.estado === 'realizado' ? '✅ *Viaje realizado*' : '🗓️ *Viaje asignado*');
   if (v.pickup) l.push(`📅 ${diaLargo(v.pickup.slice(0, 10)).replace(/^./, x => x.toUpperCase())}`);
   l.push(`🕐 Pick up asignado: ${hm(v.pickup)} h`);
@@ -1051,7 +1198,7 @@ function mensajeWA(v) {
   l.push(`⛽ Combustible: ${sn(v.combustible)}`);
   l.push(`🛣️ Peaje: ${sn(v.peaje)}`);
   l.push(`💧 Agua: ${sn(v.agua, v.aguaCant ? `${v.aguaCant} botella${v.aguaCant > 1 ? 's' : ''}` : '')}`);
-  l.push(`🧻 Toallitas: ${sn(v.toallitas, v.toallitasCant ? String(v.toallitasCant) : '')}`);
+  l.push(`🤧 Pañuelos descartables: ${sn(v.toallitas, v.toallitasCant ? String(v.toallitasCant) : '')}`);
   return l.join('\n');
 }
 function enviarWA(id) {
@@ -1068,10 +1215,29 @@ function abrirCombustible(cargaId) {
   S.cargaDraft = ex ? clone(ex) : { id: uid(), fecha: nowLocal(), litros: null, monto: null, odometro: null, lleno: true, notas: '', cotUSD: null };
   const c = S.cargaDraft;
   const t = estadoTanque();
+  const cfg = S.config.comb || {};
+  const esNivel = ex && ex.nivel != null;
+  S.nivelFrac = null;
+  const nivelHTML = `
+    <h3 class="h-sec">Nivel actual del tanque</h3>
+    <div class="fgroup">
+      <div class="note" style="margin-bottom:12px">Usalo la primera vez, o cuando quieras corregir la estimación. ${esc(cfg.vehiculo || '')} · tanque de ${fmt(num(cfg.capacidad))} L.</div>
+      <span class="flabel">¿Dónde está la aguja?</span>
+      <div style="margin-bottom:14px">${seg('nivelFrac', [['0.1', 'Reserva'], ['0.25', '¼'], ['0.5', '½'], ['0.75', '¾'], ['1', 'Lleno']], '')}</div>
+      <label class="field"><span>O la autonomía que marca el tablero</span><div class="money"><span class="cur">KM</span><input data-n="autonomia" inputmode="numeric" placeholder="Ej.: 320"></div><small>Si cargás este dato, tiene prioridad sobre la aguja: es más preciso.</small></label>
+      <label class="field"><span>Km del tablero (odómetro)</span><div class="money"><span class="cur">KM</span><input data-n="odometro" inputmode="numeric"></div><small>Opcional.</small></label>
+      <button class="btn btn-gold btn-block" style="margin-bottom:14px" data-act="guardarNivel">Guardar nivel actual</button>
+    </div>`;
   const hist = S.cargas.slice().sort((a, b) => (b.fecha || '').localeCompare(a.fecha || '')).slice(0, 15);
   abrirSheet(`
     <div class="sheet-head"><h2>Combustible</h2><button class="icon-btn" data-cerrar><i class="ic ic-close"></i></button></div>
-    ${t ? tarjetaTanque(t) : `<div class="card note">El indicador del tanque está desactivado. Cuando tengas la capacidad y la autonomía, activalo en Ajustes › Combustible. Mientras tanto, registrá las cargas y la app va juntando historial.</div>`}
+    ${t ? tarjetaTanque(t) : `<div class="card note">El indicador del tanque está desactivado. Activalo en Ajustes › Combustible. Mientras tanto, registrá las cargas y la app va juntando historial.</div>`}
+    ${esNivel ? `
+    <h3 class="h-sec">Nivel informado</h3>
+    <div class="card"><div class="split"><div><div class="r" style="font-weight:600">${ddmmyyyy(ex.fecha)} · ${hm(ex.fecha)} h</div><div class="note">${fmt(ex.nivel)} L${ex.odometro ? ' · ' + fmt(ex.odometro) + ' km' : ''}${ex.notas ? ' · ' + esc(ex.notas) : ''}</div></div>
+      <button class="btn btn-danger btn-sm" data-act="borrarCarga">Eliminar</button></div></div>
+    <button class="btn btn-soft btn-block mt" data-act="combustible">Volver</button>` : `
+    ${!ex && t && (t.sinNivel || !t.falta) ? nivelHTML : ''}
     <h3 class="h-sec">${ex ? 'Editar carga' : 'Registrar carga'}</h3>
     <div class="fgroup">
       <label class="field"><span>Fecha y hora</span><input type="datetime-local" data-c="fecha" value="${esc(c.fecha)}"></label>
@@ -1084,12 +1250,12 @@ function abrirCombustible(cargaId) {
       <div style="margin-bottom:14px">${seg('lleno', YN, String(c.lleno), 'yn')}</div>
       <label class="field"><span>Notas</span><input data-c="notas" value="${esc(c.notas)}" placeholder="Estación, tipo de combustible…"></label>
     </div>
-    <div class="btn-row"><button class="btn btn-gold" data-act="guardarCarga">${ex ? 'Guardar cambios' : 'Guardar carga'}</button>${ex ? '<button class="btn btn-danger" style="flex:0 0 auto" data-act="borrarCarga">Eliminar</button>' : ''}</div>
-    <h3 class="h-sec">Últimas cargas</h3>
+    <div class="btn-row"><button class="btn btn-gold" data-act="guardarCarga">${ex ? 'Guardar cambios' : 'Guardar carga'}</button>${ex ? '<button class="btn btn-danger" style="flex:0 0 auto" data-act="borrarCarga">Eliminar</button>' : ''}</div>`}
+    <h3 class="h-sec">Historial</h3>
     ${hist.length ? `<div class="card list-card">${hist.map(h => `
       <button class="tramo-item" style="width:100%;text-align:left" data-act="editarCarga" data-id="${esc(h.id)}">
-        <div><div class="r">${ddmmyyyy(h.fecha)} · ${hm(h.fecha)} h</div><div class="s">${h.litros ? fmt(h.litros) + ' L · ' : ''}${money(h.monto, 'ARS')}${h.odometro ? ' · ' + fmt(h.odometro) + ' km' : ''}</div></div>
-        ${h.lleno ? '<span class="badge b-gold">Lleno</span>' : '<span class="badge b-muted">Parcial</span>'}
+        <div><div class="r">${ddmmyyyy(h.fecha)} · ${hm(h.fecha)} h</div><div class="s">${h.nivel != null ? `Nivel informado: ${fmt(h.nivel)} L` : `${h.litros ? fmt(h.litros) + ' L · ' : ''}${money(h.monto, 'ARS')}`}${h.odometro ? ' · ' + fmt(h.odometro) + ' km' : ''}</div></div>
+        ${h.nivel != null ? '<span class="badge b-azul">Nivel</span>' : h.lleno ? '<span class="badge b-gold">Lleno</span>' : '<span class="badge b-muted">Parcial</span>'}
       </button>`).join('')}</div>` : '<div class="card note">Todavía no hay cargas.</div>'}
   `);
 }
@@ -1103,6 +1269,28 @@ function guardarCarga() {
   encolar({ tipo: 'guardarCarga', datos: clone(c) });
   toast('Carga registrada');
   S.sheetAbierta = false;
+  abrirCombustible();
+}
+
+function guardarNivel() {
+  const cfg = S.config.comb || {};
+  const cap = num(cfg.capacidad);
+  if (!cap) { toast('Primero cargá la capacidad del tanque en Ajustes'); return; }
+  const t = estadoTanque();
+  const rend = (t && t.rend) || (num(cfg.autonomia) ? num(cfg.autonomia) / cap : null);
+  const aut = num($('#sheet [data-n="autonomia"]').value);
+  const odo = num($('#sheet [data-n="odometro"]').value);
+  let litros, nota;
+  if (aut != null) {
+    if (!rend) { toast('Falta la autonomía del vehículo en Ajustes'); return; }
+    litros = Math.min(cap, aut / rend); nota = `Tablero: ${fmt(aut)} km de autonomía`;
+  } else if (S.nivelFrac != null) {
+    litros = cap * S.nivelFrac;
+    nota = 'Aguja: ' + { 0.1: 'reserva', 0.25: '¼', 0.5: '½', 0.75: '¾', 1: 'lleno' }[S.nivelFrac];
+  } else { toast('Elegí dónde está la aguja o cargá la autonomía del tablero'); return; }
+  const c = { id: uid(), fecha: nowLocal(), litros: null, monto: null, odometro: odo, lleno: litros >= cap * 0.98, nivel: Math.round(litros * 10) / 10, notas: nota, cotUSD: null, creado: nowLocal(), actualizado: nowLocal() };
+  encolar({ tipo: 'guardarCarga', datos: c });
+  toast('Nivel guardado: ' + fmt(c.nivel) + ' L');
   abrirCombustible();
 }
 
@@ -1122,6 +1310,20 @@ function abrirTramo(id) {
     </div>
     <datalist id="dl-l2">${lugares().map(c => `<option value="${esc(c)}">`).join('')}</datalist>
     <div class="btn-row"><button class="btn btn-gold" data-act="guardarTramo" data-id="${id ? esc(id) : ''}">Guardar</button>${id ? `<button class="btn btn-danger" style="flex:0 0 auto" data-act="borrarTramo" data-id="${esc(id)}">Eliminar</button>` : ''}</div>`);
+}
+function abrirLugar(id) {
+  const l = id ? S.config.lugares.find(x => x.id === id) : { nombre: '', km: null, min: null };
+  abrirSheet(`
+    <div class="sheet-head"><h2>${id ? 'Editar lugar' : 'Nuevo lugar'}</h2><button class="icon-btn" data-cerrar><i class="ic ic-close"></i></button></div>
+    <div class="fgroup">
+      <label class="field"><span>Nombre del lugar</span><input id="lu-n" list="dl-l3" value="${esc(l.nombre)}" placeholder="Ej.: Puerto Madero"><small>Tiene que coincidir con cómo lo escribís en Desde / Hasta.</small></label>
+      <div class="fpair">
+        <label class="field"><span>Distancia desde la base</span><div class="money"><span class="cur">KM</span><input id="lu-k" inputmode="decimal" value="${esc(l.km ?? '')}"></div></label>
+        <label class="field"><span>Tiempo de viaje</span><div class="money"><span class="cur">MIN</span><input id="lu-m" inputmode="numeric" value="${esc(l.min ?? '')}"></div></label>
+      </div>
+    </div>
+    <datalist id="dl-l3">${lugares().map(c => `<option value="${esc(c)}">`).join('')}</datalist>
+    <div class="btn-row"><button class="btn btn-gold" data-act="guardarLugar" data-id="${id ? esc(id) : ''}">Guardar</button>${id ? `<button class="btn btn-danger" style="flex:0 0 auto" data-act="borrarLugar" data-id="${esc(id)}">Eliminar</button>` : ''}</div>`);
 }
 function guardarConfig(cambios) {
   const cfg = Object.assign(clone(S.config), cambios);
@@ -1150,6 +1352,38 @@ const acciones = {
     encolar({ tipo: 'borrarViaje', id }); cerrarSheet(true); toast('Viaje eliminado');
   },
   wa: el => enviarWA(el.dataset.id),
+  usarVacio: () => { S.kmVacioManual = false; recalcVacio(); },
+  cancelarViaje: () => {
+    const motivo = prompt('Motivo de la cancelación (opcional):', '');
+    if (motivo === null) return;
+    const d = S.draft;
+    $$('#sheet [data-f]').forEach(el => { if (!el.disabled && el.dataset.f !== 'tramo') onCampoDraft(el); });
+    d.estado = 'cancelado'; d.motivoCancelacion = motivo.trim();
+    if (d.tramo === 'otro') d.tramo = '';
+    d.actualizado = nowLocal();
+    const datos = clone(d);
+    S.draftDirty = false;
+    encolar({ tipo: 'guardarViaje', datos });
+    S.draft = null;
+    abrirSheet(`
+      <div class="sheet-head"><h2>Viaje cancelado</h2><button class="icon-btn" data-cerrar><i class="ic ic-close"></i></button></div>
+      <div class="card note">El viaje queda en el historial como cancelado y no suma en los totales. Si el cliente vuelve a confirmar, abrilo y tocá <b>Reactivar viaje</b>.</div>
+      <h3 class="h-sec">Aviso para el coordinador</h3>
+      <div class="card"><pre style="white-space:pre-wrap;font-family:var(--f-body);margin:0;font-size:14px">${esc(mensajeWA(datos))}</pre></div>
+      <div class="sheet-foot">
+        <button class="btn btn-wa btn-block" data-act="wa" data-id="${esc(datos.id)}"><i class="ic ic-wa"></i> Avisar por WhatsApp</button>
+        <button class="btn btn-soft btn-block" data-cerrar>Listo</button>
+      </div>`);
+  },
+  reactivarViaje: () => {
+    const d = S.draft;
+    $$('#sheet [data-f]').forEach(el => { if (!el.disabled && el.dataset.f !== 'tramo') onCampoDraft(el); });
+    d.estado = 'agendado'; d.motivoCancelacion = ''; d.actualizado = nowLocal();
+    if (d.tramo === 'otro') d.tramo = '';
+    S.draftDirty = false;
+    encolar({ tipo: 'guardarViaje', datos: clone(d) });
+    cerrarSheet(true); toast('Viaje reactivado');
+  },
   guardarComoTramo: () => {
     const d = S.draft;
     $$('#sheet [data-f]').forEach(el => { if (!el.disabled && el.dataset.f !== 'tramo') onCampoDraft(el); });
@@ -1182,6 +1416,7 @@ const acciones = {
   combustible: () => abrirCombustible(),
   editarCarga: el => { S.sheetAbierta = false; abrirCombustible(el.dataset.id); },
   guardarCarga: () => guardarCarga(),
+  guardarNivel: () => guardarNivel(),
   borrarCarga: () => {
     if (!confirm('¿Eliminar esta carga?')) return;
     encolar({ tipo: 'borrarCarga', id: S.cargaDraft.id }); toast('Carga eliminada'); abrirCombustible();
@@ -1218,8 +1453,25 @@ const acciones = {
   quitarMeta: () => { guardarConfig({ meta: null }); toast('Meta quitada'); },
   combActivo: el => { guardarConfig({ comb: Object.assign({}, S.config.comb, { activo: el.dataset.v === '1' }) }); },
   guardarComb: () => {
-    guardarConfig({ comb: Object.assign({}, S.config.comb, { capacidad: num($('#comb-cap').value), autonomia: num($('#comb-aut').value), factor: Number($('#comb-factor').value) }) });
+    guardarConfig({ comb: Object.assign({}, S.config.comb, { vehiculo: $('#comb-veh').value.trim(), capacidad: num($('#comb-cap').value), autonomia: num($('#comb-aut').value) }) });
     toast('Datos de combustible guardados');
+  },
+  guardarBase: () => {
+    guardarConfig({ base: { estacionamiento: $('#base-est').value.trim(), domicilio: $('#base-dom').value.trim(), minutosRetiro: num($('#base-min').value) || 0 } });
+    toast('Base guardada');
+  },
+  editarLugar: el => abrirLugar(el.dataset.id),
+  guardarLugar: el => {
+    const nombre = $('#lu-n').value.trim(), km = num($('#lu-k').value), min = num($('#lu-m').value);
+    if (!nombre || km == null) { toast('Completá el nombre y los km'); return; }
+    let ls = clone(S.config.lugares || []);
+    if (el.dataset.id) ls = ls.map(l => l.id === el.dataset.id ? Object.assign(l, { nombre, km, min }) : l);
+    else ls.push({ id: uid(), nombre, km, min });
+    guardarConfig({ lugares: ls }); cerrarSheet(true); toast('Lugar guardado');
+  },
+  borrarLugar: el => {
+    if (!confirm('¿Eliminar este lugar?')) return;
+    guardarConfig({ lugares: S.config.lugares.filter(l => l.id !== el.dataset.id) }); cerrarSheet(true);
   },
   sync: () => sincronizar(true),
   bloquear: () => bloquear(),
@@ -1239,7 +1491,8 @@ document.addEventListener('click', ev => {
     const g = segBtn.parentElement;
     $$('button', g).forEach(b => b.classList.toggle('on', b === segBtn));
     const name = g.dataset.seg, v = segBtn.dataset.v;
-    if (S.cargaDraft && name === 'lleno') S.cargaDraft.lleno = v === 'true';
+    if (name === 'nivelFrac') S.nivelFrac = Number(v);
+    else if (S.cargaDraft && name === 'lleno') S.cargaDraft.lleno = v === 'true';
     else onSegDraft(name, v);
     return;
   }
@@ -1299,7 +1552,7 @@ function iniciarDemo() {
   S.demo = true;
   S.config = clone(CONFIG_DEF);
   S.config.cotUSD = 1450; S.config.cotEUR = 1680; S.config.cotFecha = hoyStr();
-  S.config.comb = { activo: true, capacidad: 50, autonomia: 600, factor: 1.5 };
+  S.config.comb = clone(CONFIG_DEF.comb);
   const h = hoyStr();
   S.config.meta = { nombre: 'Quincena', desde: addDays(h, -10), hasta: addDays(h, 4), monto: 1500 };
   const cli = [['Martín Rossi', 'Otra provincia', 'Córdoba'], ['Laura Gómez', 'Local', ''], ['John Miller', 'Extranjero', 'Estados Unidos'], ['Ana Souza', 'Extranjero', 'Brasil'], ['Pierre Dubois', 'Extranjero', 'Francia'], ['Carla Méndez', 'Otra provincia', 'Mendoza'], ['Diego Paz', 'Local', '']];
@@ -1319,7 +1572,7 @@ function iniciarDemo() {
     const moneda = ['USD', 'ARS', 'EUR', 'USD'][Math.floor(rnd() * 4)];
     viajes.push(normViaje({
       id: 'demo' + i, estado: 'realizado', conocimiento: `${addDays(dia, -1)}T18:00`, pickup, subio: dStr(subio) + 'T' + subio.toTimeString().slice(0, 5),
-      cliente: c[0], procTipo: c[1], procDetalle: c[2], pasajeros: 1 + Math.floor(rnd() * 3), tramo: t.id, origen: t.origen, destino: t.destino, km: t.km,
+      cliente: c[0], procTipo: c[1], procDetalle: c[2], pasajeros: 1 + Math.floor(rnd() * 3), tramo: t.id, origen: t.origen, destino: t.destino, km: t.km, kmVacio: kmVacioSugerido(t.origen, t.destino),
       monto: t.monto, pago: i < 2 || rnd() < 0.1 ? 'pendiente' : 'cobrado', propina, propinaMonto: propina ? (moneda === 'ARS' ? 10000 : 5 + Math.floor(rnd() * 3) * 5) : null, propinaMoneda: moneda,
       peaje: t.km > 20, peajeMonto: t.km > 20 ? 2800 : null, combustible: false, agua: rnd() < 0.6, aguaCant: 1 + Math.floor(rnd() * 2), toallitas: rnd() < 0.4, toallitasCant: 1,
       cotUSD: 1450, cotEUR: 1680, creado: pickup, actualizado: pickup
@@ -1327,8 +1580,10 @@ function iniciarDemo() {
   }
   const ahora = toDate(nowLocal());
   const en = m => { const d = new Date(ahora.getTime() + m * 6e4); return dStr(d) + 'T' + d.toTimeString().slice(0, 5); };
-  viajes.push(normViaje({ id: 'demoA', estado: 'agendado', conocimiento: en(-300), pickup: en(95), cliente: 'John Miller', procTipo: 'Extranjero', procDetalle: 'Estados Unidos', pasajeros: 2, tramo: tr[0].id, origen: tr[0].origen, destino: tr[0].destino, km: tr[0].km, monto: tr[0].monto, pago: 'pendiente', notas: 'Vuelo AA 931' }));
-  viajes.push(normViaje({ id: 'demoB', estado: 'agendado', conocimiento: en(-120), pickup: en(60 * 20), cliente: 'Ana Souza', procTipo: 'Extranjero', procDetalle: 'Brasil', pasajeros: 1, tramo: tr[4].id, origen: tr[4].origen, destino: tr[4].destino, km: tr[4].km, monto: tr[4].monto, pago: 'pendiente' }));
+  viajes.push(normViaje({ id: 'demoA', estado: 'agendado', conocimiento: en(-300), pickup: en(95), cliente: 'John Miller', procTipo: 'Extranjero', procDetalle: 'Estados Unidos', pasajeros: 2, tramo: tr[0].id, origen: tr[0].origen, destino: tr[0].destino, km: tr[0].km, kmVacio: kmVacioSugerido(tr[0].origen, tr[0].destino), monto: tr[0].monto, pago: 'pendiente', notas: 'Vuelo AA 931' }));
+  viajes.push(normViaje({ id: 'demoB', estado: 'agendado', conocimiento: en(-120), pickup: en(60 * 20), cliente: 'Ana Souza', procTipo: 'Extranjero', procDetalle: 'Brasil', pasajeros: 1, tramo: tr[4].id, origen: tr[4].origen, destino: tr[4].destino, km: tr[4].km, kmVacio: kmVacioSugerido(tr[4].origen, tr[4].destino), monto: tr[4].monto, pago: 'pendiente', base: 'domicilio' }));
+  viajes.push(normViaje({ id: 'demoC', estado: 'agendado', conocimiento: en(-60), pickup: en(60 * 26), cliente: 'Pierre Dubois', procTipo: 'Extranjero', procDetalle: 'Francia', pasajeros: 2, tramo: tr[2].id, origen: tr[2].origen, destino: tr[2].destino, km: tr[2].km, kmVacio: kmVacioSugerido(tr[2].origen, tr[2].destino), monto: tr[2].monto, pago: 'pendiente' }));
+  viajes[3].estado = 'cancelado'; viajes[3].motivoCancelacion = 'Cambio de vuelo';
   S.viajes = viajes;
   S.cargas = [
     normCarga({ id: 'c1', fecha: `${addDays(h, -9)}T08:00`, litros: 45, monto: 58000, odometro: 41200, lleno: true, cotUSD: 1450 }),

@@ -1,5 +1,5 @@
 /* Ganancias infinitas · funcionamiento sin conexión */
-const CACHE = 'ganancias-v1.1.0';
+const CACHE = 'ganancias-v1.2.0';
 const ARCHIVOS = ['./', 'index.html', 'styles.css', 'app.js', 'manifest.webmanifest', 'icon.svg', 'icon-180.png', 'icon-192.png', 'icon-512.png'];
 
 self.addEventListener('install', e => {
